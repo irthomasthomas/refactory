@@ -2,7 +2,7 @@ import os
 import argparse
 import asyncio
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import logging
 from dataclasses import dataclass
 from functools import wraps
@@ -14,6 +14,7 @@ import tiktoken
 from pydantic_settings import BaseSettings
 import random
 import pytest
+from tqdm import tqdm
 
 # Load environment variables
 load_dotenv()
@@ -37,7 +38,7 @@ def configure_logging():
 configure_logging()
 logger = logging.getLogger(__name__)
 
-encoder = tiktoken.encoding_for_model("gpt-4o")
+encoder = tiktoken.encoding_for_model("gpt-4")
 
 @dataclass
 class APIResponse:
@@ -53,9 +54,9 @@ class CodeProcessingResult:
 
 class Config(BaseSettings):
     BASE_URL: str = "https://api.anthropic.com/v1/messages"
-    MODEL: str = "claude-3-5-sonnet-20240620"
-    MAX_TOKENS: int = 8000
-    MAX_RETRIES: int = 8
+    MODEL: str = "claude-3-opus-20240229"
+    MAX_TOKENS: int = 4096
+    MAX_RETRIES: int = 5
     TIMEOUT: int = 160
     API_KEY: str
 
@@ -100,7 +101,6 @@ class AnthropicAPI:
             "x-api-key": self.config.API_KEY,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-            "anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15",
         }
         payload = {
             "model": self.config.MODEL,
@@ -314,7 +314,6 @@ class FileUtils:
         """Read file and wrap its content with XML tags based on the file name."""
         async with aiofiles.open(file_path, 'r') as f:
             content = await f.read()
-            # Use XML cdata section to safely wrap the content.
             wrapped_content = f"<{os.path.basename(file_path)}><![CDATA[{content}]]></{os.path.basename(file_path)}>"
             return wrapped_content
 
@@ -327,9 +326,7 @@ class FileUtils:
     @staticmethod
     async def read_files(file_paths: List[str]) -> str:
         """Read multiple files and wrap each individual file's content with XML tags"""
-        # Gathering all file contents as a list of tasks
         contents = await asyncio.gather(*[FileUtils.read_file(f) for f in file_paths if not os.path.basename(f).startswith('.')])
-        # Joining all the wrapped contents into a single string
         return "\n".join(contents)
 
 def get_system_prompt(generate_features: bool, generate_tests: bool, user_prompt: Optional[str] = None) -> str:
@@ -343,84 +340,3 @@ def get_system_prompt(generate_features: bool, generate_tests: bool, user_prompt
     </REVIEW>
     <REFACTORED_CODE>
     [Your refactored code here]
-    </REFACTORED_CODE>
-    """
-    
-    extended_prompt = "\nAdd a new feature to the provided code." if generate_features else "\nRefactor and improve the provided code."
-    
-    if generate_tests:
-        extended_prompt += "\nGenerate comprehensive unit tests for the refactored code."
-        base_prompt += """
-    <TESTS>
-    [Generated unit tests here]
-    </TESTS>
-    """
-
-    if user_prompt:
-        return base_prompt + extended_prompt + f"\nAdditional instructions: {user_prompt}"
-
-    return base_prompt + extended_prompt
-
-async def process_target(target: str, project_files: List[str], doc_files: List[str], save_intermediate: bool, create_review: bool, generate_features: bool, generate_tests: bool, user_prompt: Optional[str] = None) -> None:
-    async with AnthropicAPI() as api:
-        merger = CodeMerger(api)
-        if os.path.isfile(target):
-            result = await CodeProcessor.process_file(target, project_files, doc_files, save_intermediate, create_review, generate_features, generate_tests, user_prompt)
-            if result:
-                await merger.finalize_merge(result.original, result.refactored, result.review, result.tests,
-                                            os.path.join(os.path.dirname(target), f"final_{os.path.basename(target)}"))
-        elif os.path.isdir(target):
-            tasks = []
-            for root, _, files in os.walk(target):
-                for file in files:
-                    if file.endswith('.py') and not file.startswith('.'):
-                        file_path = os.path.join(root, file)
-                        tasks.append(CodeProcessor.process_file(file_path, project_files, doc_files, save_intermediate, create_review, generate_features, generate_tests, user_prompt))
-            results = await asyncio.gather(*tasks)
-            for result in results:
-                if result:
-                    await merger.finalize_merge(result.original, result.refactored, result.review, result.tests,
-                                                os.path.join(os.path.dirname(result.original), f"final_{os.path.basename(result.original)}"))
-        else:
-            logger.error(f"{target} is not a valid file or directory")
-
-async def run_tests(target: str) -> None:
-    if os.path.isfile(target):
-        pytest.main([target])
-    elif os.path.isdir(target):
-        pytest.main([target])
-    else:
-        logger.error(f"{target} is not a valid file or directory for running tests")
-
-async def main() -> None:
-    parser = argparse.ArgumentParser(description="Improve and merge code using Claude API")
-    parser.add_argument("--project", required=True, help="Project directory or file")
-    parser.add_argument("--target", nargs='+', help="Target file(s) or directory to improve")
-    parser.add_argument("--docs", nargs='+', help="Additional document files")
-    parser.add_argument("--save-intermediate", action="store_true", help="Save intermediate results")
-    parser.add_argument("--create-review", action="store_true", help="Create code review")
-    parser.add_argument("--generate-features", action="store_true", help="Generate new features for the code")
-    parser.add_argument("--generate-tests", action="store_true", help="Generate unit tests for the code")
-    parser.add_argument("--run-tests", action="store_true", help="Run generated tests after processing")
-    parser.add_argument("--prompt", help="Add a user prompt to steer the code generation/refactoring")
-    args = parser.parse_args()
-
-    project_files = [
-        os.path.join(root, f)
-        for root, _, files in os.walk(args.project)
-        for f in files
-        if f.endswith(('.py', '.txt', '.md')) and not f.startswith('.')
-    ]
-
-    doc_files = args.docs or []
-    targets = args.target or [args.project]
-    user_prompt = args.prompt
-    
-    await asyncio.gather(*[process_target(target, project_files, doc_files, args.save_intermediate, args.create_review, args.generate_features, args.generate_tests, user_prompt) for target in targets])
-
-    if args.run_tests:
-        for target in targets:
-            await run_tests(target)
-
-if __name__ == "__main__":
-    asyncio.run(main())
